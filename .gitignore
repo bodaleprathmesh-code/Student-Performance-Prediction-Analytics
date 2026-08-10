@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter cache
+.ipynb_checkpoints/
+
+# Environment / secret files
+.env
+*.env
+
+# API keys / credentials
+secrets/
+credentials/
+config/secrets.py
+
+# Private files
+*.key
+*.pem

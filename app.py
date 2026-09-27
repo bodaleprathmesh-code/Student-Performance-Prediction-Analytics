@@ -122,11 +122,29 @@ div[data-testid="stMetricValue"] { color: var(--ink); font-weight: 800; }
    This prevents the large blank vertical area seen on the login page. */
 .st-key-auth_page {
     width: min(1120px, 100%);
-    margin: 0 auto;
-    padding: 0;
+    margin: 0 auto !important;
+    padding: 0 !important;
 }
 .st-key-auth_page > div:first-child {
-    align-items: stretch;
+    align-items: stretch !important;
+}
+.st-key-auth_page [data-testid="stHorizontalBlock"] {
+    align-items: stretch !important;
+}
+.st-key-auth_page [data-testid="column"] {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+}
+.st-key-auth_form_panel {
+    min-height: 610px;
+    height: 100%;
+    padding: 42px 48px !important;
+    background: #fff;
+    border-radius: 0 24px 24px 0;
+    box-sizing: border-box;
+}
+.st-key-auth_form_panel > div:first-child {
+    padding: 0 !important;
 }
 .auth-brand-panel {
     min-height: 610px;
@@ -565,6 +583,140 @@ def reset_user_password(user_id, new_password):
         connection.commit()
 
 
+def _secret_value(name, default=""):
+    """Read a Streamlit secret without exposing it in the application UI."""
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        return default
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def bootstrap_admin_from_secrets():
+    """Create or repair the first admin account on Streamlit Cloud.
+
+    Required Streamlit secrets:
+        ADMIN_USER_ID
+        ADMIN_EMAIL
+        ADMIN_FULL_NAME
+        ADMIN_PASSWORD
+
+    Optional:
+        ADMIN_FORCE_PASSWORD_RESET = "true"
+
+    The password is never stored in source code or GitHub. Only its salted
+    PBKDF2 hash is stored in the local SQLite database.
+    """
+    admin_user_id = normalize_user_id(_secret_value("ADMIN_USER_ID"))
+    admin_email = normalize_email(_secret_value("ADMIN_EMAIL"))
+    admin_full_name = _secret_value("ADMIN_FULL_NAME")
+    admin_password = _secret_value("ADMIN_PASSWORD")
+    force_reset = _secret_value("ADMIN_FORCE_PASSWORD_RESET", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
+
+    # If deployment secrets are not configured, do nothing.
+    if not all([admin_user_id, admin_email, admin_full_name, admin_password]):
+        return
+
+    if not valid_user_id(admin_user_id) or not valid_email(admin_email):
+        return
+
+    if not password_is_strong(admin_password):
+        return
+
+    password_hash_value, salt = hash_password(admin_password)
+
+    with get_db_connection() as connection:
+        existing = connection.execute(
+            "SELECT id, user_id, email FROM users WHERE user_id = ? COLLATE NOCASE",
+            (admin_user_id,),
+        ).fetchone()
+
+        if existing is None:
+            # If the requested User ID is new but the email already exists,
+            # update that existing account instead of creating a duplicate.
+            existing_by_email = connection.execute(
+                "SELECT id, user_id FROM users WHERE email = ? COLLATE NOCASE",
+                (admin_email,),
+            ).fetchone()
+
+            if existing_by_email is None:
+                connection.execute(
+                    """
+                    INSERT INTO users
+                    (user_id, email, full_name, password_hash, salt, role, status)
+                    VALUES (?, ?, ?, ?, ?, 'admin', 'active')
+                    """,
+                    (
+                        admin_user_id,
+                        admin_email,
+                        admin_full_name,
+                        password_hash_value,
+                        salt,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO admin_activity
+                    (admin_user_id, action, target_user_id, details)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        admin_user_id,
+                        "BOOTSTRAP_ADMIN_CREATED",
+                        admin_user_id,
+                        "Administrator created from Streamlit Secrets",
+                    ),
+                )
+            else:
+                target_id = existing_by_email["user_id"]
+                connection.execute(
+                    """
+                    UPDATE users
+                    SET user_id = ?, full_name = ?, role = 'admin', status = 'active'
+                    WHERE id = ?
+                    """,
+                    (admin_user_id, admin_full_name, existing_by_email["id"]),
+                )
+                if force_reset:
+                    connection.execute(
+                        "UPDATE users SET password_hash = ?, salt = ? WHERE id = ?",
+                        (password_hash_value, salt, existing_by_email["id"]),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO admin_activity
+                    (admin_user_id, action, target_user_id, details)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        admin_user_id,
+                        "BOOTSTRAP_ADMIN_REPAIRED",
+                        admin_user_id,
+                        f"Administrator repaired from Streamlit Secrets; previous user ID: {target_id}",
+                    ),
+                )
+        else:
+            connection.execute(
+                """
+                UPDATE users
+                SET email = ?, full_name = ?, role = 'admin', status = 'active'
+                WHERE id = ?
+                """,
+                (admin_email, admin_full_name, existing["id"]),
+            )
+            if force_reset:
+                connection.execute(
+                    "UPDATE users SET password_hash = ?, salt = ? WHERE id = ?",
+                    (password_hash_value, salt, existing["id"]),
+                )
+
+        connection.commit()
+
+
 def login_screen():
     """Render the authentication screen without the old blank vertical wrapper."""
     with st.container(key="auth_page"):
@@ -812,6 +964,7 @@ def login_screen():
 
 
 initialize_auth_database()
+bootstrap_admin_from_secrets()
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
